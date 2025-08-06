@@ -1,0 +1,530 @@
+# Azure DevOps Pipeline for Cognizant Talent & Engagement Hub (CTEH)
+# This pipeline builds, tests, and deploys the CTEH platform to Azure App Services
+
+trigger:
+  branches:
+    include:
+    - main
+    - develop
+    - release/*
+  paths:
+    exclude:
+    - README.md
+    - docs/*
+    - '*.md'
+
+pr:
+  branches:
+    include:
+    - main
+    - develop
+  paths:
+    exclude:
+    - README.md
+    - docs/*
+    - '*.md'
+
+variables:
+  # Build Configuration
+  buildConfiguration: 'Release'
+  nodeVersion: '18.x'
+  
+  # Azure Configuration
+  azureSubscription: 'CTEH-Production'
+  resourceGroupName: 'rg-cteh-$(environment)'
+  webAppName: 'cteh-platform-$(environment)'
+  
+  # Container Registry
+  containerRegistry: 'ctehregistry.azurecr.io'
+  imageRepository: 'cteh/platform'
+  dockerfilePath: '$(Build.SourcesDirectory)/Dockerfile'
+  tag: '$(Build.BuildId)'
+
+  # Environment-specific variables
+  ${{ if eq(variables['Build.SourceBranch'], 'refs/heads/main') }}:
+    environment: 'production'
+    deploymentSlot: 'production'
+  ${{ elseif eq(variables['Build.SourceBranch'], 'refs/heads/develop') }}:
+    environment: 'staging'
+    deploymentSlot: 'staging'
+  ${{ else }}:
+    environment: 'development'
+    deploymentSlot: 'development'
+
+stages:
+- stage: Build
+  displayName: 'Build and Test'
+  jobs:
+  - job: BuildAndTest
+    displayName: 'Build and Test Application'
+    pool:
+      vmImage: 'ubuntu-latest'
+    
+    steps:
+    # Checkout source code
+    - checkout: self
+      displayName: 'Checkout Repository'
+      fetchDepth: 1
+
+    # Setup Node.js
+    - task: NodeTool@0
+      displayName: 'Install Node.js $(nodeVersion)'
+      inputs:
+        versionSpec: '$(nodeVersion)'
+
+    # Cache dependencies for faster builds
+    - task: Cache@2
+      displayName: 'Cache npm dependencies'
+      inputs:
+        key: 'npm | "$(Agent.OS)" | package-lock.json'
+        restoreKeys: |
+          npm | "$(Agent.OS)"
+          npm
+        path: '$(npm_config_cache)'
+
+    - task: Cache@2
+      displayName: 'Cache client npm dependencies'
+      inputs:
+        key: 'npm-client | "$(Agent.OS)" | client/package-lock.json'
+        restoreKeys: |
+          npm-client | "$(Agent.OS)"
+          npm-client
+        path: 'client/node_modules'
+
+    # Install backend dependencies
+    - script: |
+        npm ci --production=false
+      displayName: 'Install Backend Dependencies'
+      workingDirectory: '$(Build.SourcesDirectory)'
+
+    # Install frontend dependencies
+    - script: |
+        npm ci --production=false
+      displayName: 'Install Frontend Dependencies'
+      workingDirectory: '$(Build.SourcesDirectory)/client'
+
+    # Lint backend code
+    - script: |
+        npm run lint
+      displayName: 'Lint Backend Code'
+      workingDirectory: '$(Build.SourcesDirectory)'
+
+    # Lint frontend code
+    - script: |
+        npm run lint
+      displayName: 'Lint Frontend Code'
+      workingDirectory: '$(Build.SourcesDirectory)/client'
+
+    # Type check backend
+    - script: |
+        npx tsc --noEmit
+      displayName: 'TypeScript Type Check - Backend'
+      workingDirectory: '$(Build.SourcesDirectory)'
+
+    # Type check frontend
+    - script: |
+        npm run type-check
+      displayName: 'TypeScript Type Check - Frontend'
+      workingDirectory: '$(Build.SourcesDirectory)/client'
+
+    # Run backend tests
+    - script: |
+        npm run test -- --coverage --watchAll=false --ci
+      displayName: 'Run Backend Tests'
+      workingDirectory: '$(Build.SourcesDirectory)'
+
+    # Run frontend tests
+    - script: |
+        npm run test -- --coverage --run
+      displayName: 'Run Frontend Tests'
+      workingDirectory: '$(Build.SourcesDirectory)/client'
+
+    # Publish test results
+    - task: PublishTestResults@2
+      displayName: 'Publish Backend Test Results'
+      condition: succeededOrFailed()
+      inputs:
+        testResultsFormat: 'JUnit'
+        testResultsFiles: '**/junit.xml'
+        searchFolder: '$(Build.SourcesDirectory)'
+        mergeTestResults: true
+        testRunTitle: 'Backend Tests'
+
+    - task: PublishTestResults@2
+      displayName: 'Publish Frontend Test Results'
+      condition: succeededOrFailed()
+      inputs:
+        testResultsFormat: 'JUnit'
+        testResultsFiles: '**/junit.xml'
+        searchFolder: '$(Build.SourcesDirectory)/client'
+        mergeTestResults: true
+        testRunTitle: 'Frontend Tests'
+
+    # Publish code coverage
+    - task: PublishCodeCoverageResults@1
+      displayName: 'Publish Code Coverage - Backend'
+      condition: succeededOrFailed()
+      inputs:
+        codeCoverageTool: 'Cobertura'
+        summaryFileLocation: '$(Build.SourcesDirectory)/coverage/cobertura-coverage.xml'
+        reportDirectory: '$(Build.SourcesDirectory)/coverage'
+
+    - task: PublishCodeCoverageResults@1
+      displayName: 'Publish Code Coverage - Frontend'
+      condition: succeededOrFailed()
+      inputs:
+        codeCoverageTool: 'Cobertura'
+        summaryFileLocation: '$(Build.SourcesDirectory)/client/coverage/cobertura-coverage.xml'
+        reportDirectory: '$(Build.SourcesDirectory)/client/coverage'
+
+    # Security scan with npm audit
+    - script: |
+        npm audit --audit-level moderate
+      displayName: 'Security Audit - Backend'
+      workingDirectory: '$(Build.SourcesDirectory)'
+      continueOnError: true
+
+    - script: |
+        npm audit --audit-level moderate
+      displayName: 'Security Audit - Frontend'
+      workingDirectory: '$(Build.SourcesDirectory)/client'
+      continueOnError: true
+
+    # Build application
+    - script: |
+        npm run build
+      displayName: 'Build Application'
+      workingDirectory: '$(Build.SourcesDirectory)'
+
+    # Create deployment package
+    - task: ArchiveFiles@2
+      displayName: 'Create Deployment Package'
+      inputs:
+        rootFolderOrFile: '$(Build.SourcesDirectory)'
+        includeRootFolder: false
+        archiveType: 'zip'
+        archiveFile: '$(Build.ArtifactStagingDirectory)/cteh-$(Build.BuildId).zip'
+        replaceExistingArchive: true
+        verbose: true
+
+    # Publish build artifacts
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Build Artifacts'
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+        ArtifactName: 'drop'
+        publishLocation: 'Container'
+
+- stage: BuildContainer
+  displayName: 'Build and Push Container'
+  dependsOn: Build
+  condition: and(succeeded(), or(eq(variables['Build.SourceBranch'], 'refs/heads/main'), eq(variables['Build.SourceBranch'], 'refs/heads/develop')))
+  jobs:
+  - job: BuildContainer
+    displayName: 'Build and Push Docker Container'
+    pool:
+      vmImage: 'ubuntu-latest'
+    
+    steps:
+    # Checkout source code
+    - checkout: self
+      displayName: 'Checkout Repository'
+
+    # Login to Azure Container Registry
+    - task: Docker@2
+      displayName: 'Login to Container Registry'
+      inputs:
+        command: 'login'
+        containerRegistry: '$(containerRegistry)'
+
+    # Build and push Docker image
+    - task: Docker@2
+      displayName: 'Build and Push Docker Image'
+      inputs:
+        command: 'buildAndPush'
+        repository: '$(imageRepository)'
+        dockerfile: '$(dockerfilePath)'
+        containerRegistry: '$(containerRegistry)'
+        tags: |
+          $(tag)
+          latest-$(environment)
+        arguments: '--build-arg NODE_ENV=$(environment)'
+
+    # Scan container for vulnerabilities
+    - task: AquaSecurityTrivy@4
+      displayName: 'Container Security Scan'
+      inputs:
+        image: '$(containerRegistry)/$(imageRepository):$(tag)'
+        exitCode: '1'
+        severities: 'HIGH,CRITICAL'
+      continueOnError: true
+
+- stage: DeployInfrastructure
+  displayName: 'Deploy Infrastructure'
+  dependsOn: Build
+  condition: and(succeeded(), or(eq(variables['Build.SourceBranch'], 'refs/heads/main'), eq(variables['Build.SourceBranch'], 'refs/heads/develop')))
+  jobs:
+  - deployment: DeployInfrastructure
+    displayName: 'Deploy Azure Infrastructure'
+    pool:
+      vmImage: 'ubuntu-latest'
+    environment: '$(environment)'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          # Download build artifacts
+          - download: current
+            artifact: drop
+            displayName: 'Download Build Artifacts'
+
+          # Deploy ARM template
+          - task: AzureResourceManagerTemplateDeployment@3
+            displayName: 'Deploy Azure Resources'
+            inputs:
+              deploymentScope: 'Resource Group'
+              azureResourceManagerConnection: '$(azureSubscription)'
+              subscriptionId: '$(subscriptionId)'
+              action: 'Create Or Update Resource Group'
+              resourceGroupName: '$(resourceGroupName)'
+              location: '$(location)'
+              templateLocation: 'Linked artifact'
+              csmFile: '$(Pipeline.Workspace)/drop/azure-deploy.json'
+              overrideParameters: |
+                -appName "cteh-platform"
+                -environment "$(environment)"
+                -location "$(location)"
+                -skuName "S1"
+              deploymentMode: 'Incremental'
+              deploymentName: 'CTEH-Infrastructure-$(Build.BuildId)'
+
+- stage: DeployApplication
+  displayName: 'Deploy Application'
+  dependsOn: 
+  - BuildContainer
+  - DeployInfrastructure
+  condition: and(succeeded(), or(eq(variables['Build.SourceBranch'], 'refs/heads/main'), eq(variables['Build.SourceBranch'], 'refs/heads/develop')))
+  jobs:
+  - deployment: DeployApp
+    displayName: 'Deploy Application to Azure App Service'
+    pool:
+      vmImage: 'ubuntu-latest'
+    environment: '$(environment)'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          # Deploy to Azure App Service
+          - task: AzureWebAppContainer@1
+            displayName: 'Deploy Container to App Service'
+            inputs:
+              azureSubscription: '$(azureSubscription)'
+              appName: '$(webAppName)'
+              slotName: '$(deploymentSlot)'
+              containers: '$(containerRegistry)/$(imageRepository):$(tag)'
+              containerCommand: 'npm start'
+              appSettings: |
+                -NODE_ENV $(environment)
+                -WEBSITES_PORT 3000
+                -WEBSITES_ENABLE_APP_SERVICE_STORAGE false
+
+          # Run smoke tests
+          - task: PowerShell@2
+            displayName: 'Run Smoke Tests'
+            inputs:
+              targetType: 'inline'
+              script: |
+                $appUrl = "https://$(webAppName).azurewebsites.net"
+                Write-Host "Testing application at: $appUrl"
+                
+                # Wait for app to be ready
+                Start-Sleep -Seconds 30
+                
+                try {
+                  $response = Invoke-WebRequest -Uri "$appUrl/health" -TimeoutSec 30
+                  if ($response.StatusCode -eq 200) {
+                    Write-Host "✅ Health check passed"
+                  } else {
+                    Write-Error "❌ Health check failed with status: $($response.StatusCode)"
+                    exit 1
+                  }
+                } catch {
+                  Write-Error "❌ Health check failed: $($_.Exception.Message)"
+                  exit 1
+                }
+                
+                # Test API endpoint
+                try {
+                  $apiResponse = Invoke-WebRequest -Uri "$appUrl/api/v1/status" -TimeoutSec 30
+                  if ($apiResponse.StatusCode -eq 200) {
+                    Write-Host "✅ API status check passed"
+                  } else {
+                    Write-Error "❌ API status check failed with status: $($apiResponse.StatusCode)"
+                    exit 1
+                  }
+                } catch {
+                  Write-Error "❌ API status check failed: $($_.Exception.Message)"
+                  exit 1
+                }
+                
+                Write-Host "🚀 Deployment successful!"
+
+          # Warm up the application
+          - task: PowerShell@2
+            displayName: 'Warm Up Application'
+            inputs:
+              targetType: 'inline'
+              script: |
+                $appUrl = "https://$(webAppName).azurewebsites.net"
+                
+                # Warm up key endpoints
+                $endpoints = @(
+                  "/",
+                  "/api/v1/auth/status",
+                  "/api/v1/skills",
+                  "/api/v1/users/profile"
+                )
+                
+                foreach ($endpoint in $endpoints) {
+                  try {
+                    Write-Host "Warming up: $appUrl$endpoint"
+                    $response = Invoke-WebRequest -Uri "$appUrl$endpoint" -TimeoutSec 30 -ErrorAction SilentlyContinue
+                    Write-Host "Status: $($response.StatusCode)"
+                  } catch {
+                    Write-Host "Warning: Could not warm up $endpoint"
+                  }
+                }
+
+- stage: ProductionValidation
+  displayName: 'Production Validation'
+  dependsOn: DeployApplication
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  jobs:
+  - job: ValidationTests
+    displayName: 'Run Production Validation Tests'
+    pool:
+      vmImage: 'ubuntu-latest'
+    
+    steps:
+    # Run comprehensive validation tests
+    - task: PowerShell@2
+      displayName: 'Production Validation Suite'
+      inputs:
+        targetType: 'inline'
+        script: |
+          $appUrl = "https://$(webAppName).azurewebsites.net"
+          $testResults = @()
+          
+          # Test suite
+          $tests = @{
+            "Application Health" = "/health"
+            "API Status" = "/api/v1/status"
+            "Authentication Endpoint" = "/api/v1/auth/status"
+            "Skills API" = "/api/v1/skills"
+            "Static Assets" = "/favicon.ico"
+          }
+          
+          Write-Host "🔍 Running production validation tests..."
+          
+          foreach ($testName in $tests.Keys) {
+            $endpoint = $tests[$testName]
+            $url = "$appUrl$endpoint"
+            
+            try {
+              $response = Invoke-WebRequest -Uri $url -TimeoutSec 30 -ErrorAction Stop
+              $testResults += [PSCustomObject]@{
+                Test = $testName
+                Status = "✅ PASS"
+                StatusCode = $response.StatusCode
+                ResponseTime = "< 30s"
+              }
+              Write-Host "✅ $testName - Status: $($response.StatusCode)"
+            } catch {
+              $testResults += [PSCustomObject]@{
+                Test = $testName
+                Status = "❌ FAIL"
+                StatusCode = $_.Exception.Response.StatusCode.value__
+                ResponseTime = "Timeout/Error"
+              }
+              Write-Host "❌ $testName - Error: $($_.Exception.Message)"
+            }
+          }
+          
+          # Display results
+          Write-Host "`n📊 Validation Results:"
+          $testResults | Format-Table -AutoSize
+          
+          # Check if any tests failed
+          $failedTests = $testResults | Where-Object { $_.Status -like "*FAIL*" }
+          if ($failedTests.Count -gt 0) {
+            Write-Error "❌ $($failedTests.Count) validation test(s) failed!"
+            exit 1
+          } else {
+            Write-Host "🎉 All validation tests passed!"
+          }
+
+    # Performance baseline test
+    - task: PowerShell@2
+      displayName: 'Performance Baseline Test'
+      inputs:
+        targetType: 'inline'
+        script: |
+          $appUrl = "https://$(webAppName).azurewebsites.net"
+          
+          Write-Host "⚡ Running performance baseline test..."
+          
+          $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+          try {
+            $response = Invoke-WebRequest -Uri $appUrl -TimeoutSec 60
+            $stopwatch.Stop()
+            
+            $responseTime = $stopwatch.ElapsedMilliseconds
+            Write-Host "📈 Homepage load time: $responseTime ms"
+            
+            if ($responseTime -lt 5000) {
+              Write-Host "✅ Performance baseline met (< 5 seconds)"
+            } else {
+              Write-Warning "⚠️ Performance baseline exceeded (> 5 seconds)"
+            }
+          } catch {
+            $stopwatch.Stop()
+            Write-Error "❌ Performance test failed: $($_.Exception.Message)"
+            exit 1
+          }
+
+# Post-deployment notifications
+- stage: Notifications
+  displayName: 'Deployment Notifications'
+  dependsOn: 
+  - DeployApplication
+  - ProductionValidation
+  condition: always()
+  jobs:
+  - job: SendNotifications
+    displayName: 'Send Deployment Notifications'
+    pool:
+      vmImage: 'ubuntu-latest'
+    
+    steps:
+    # Send deployment notification (customize based on your notification system)
+    - task: PowerShell@2
+      displayName: 'Send Deployment Notification'
+      inputs:
+        targetType: 'inline'
+        script: |
+          $status = if ($env:AGENT_JOBSTATUS -eq "Succeeded") { "✅ SUCCESS" } else { "❌ FAILED" }
+          $environment = "$(environment)".ToUpper()
+          $buildId = "$(Build.BuildId)"
+          $appUrl = "https://$(webAppName).azurewebsites.net"
+          
+          Write-Host "📢 Deployment Notification:"
+          Write-Host "Environment: $environment"
+          Write-Host "Status: $status"
+          Write-Host "Build ID: $buildId"
+          Write-Host "Application URL: $appUrl"
+          Write-Host "Deployed by: $(Build.RequestedFor)"
+          Write-Host "Branch: $(Build.SourceBranchName)"
+          Write-Host "Commit: $(Build.SourceVersion)"
+          
+          # Here you can integrate with Teams, Slack, email, etc.
+          # Example: Send to Teams webhook, Slack webhook, or email service
