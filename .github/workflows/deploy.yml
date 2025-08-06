@@ -1,0 +1,486 @@
+name: 🚀 CTEH Platform CI/CD
+
+on:
+  push:
+    branches: [ main, develop, release/* ]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+  pull_request:
+    branches: [ main, develop ]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+        - development
+        - staging
+        - production
+
+env:
+  NODE_VERSION: '18.x'
+  AZURE_WEBAPP_NAME: cteh-platform
+  CONTAINER_REGISTRY: ctehregistry.azurecr.io
+  IMAGE_NAME: cteh/platform
+
+jobs:
+  # Set environment based on branch or manual input
+  setup:
+    name: 🔧 Setup Environment
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.set-env.outputs.environment }}
+      deploy: ${{ steps.set-env.outputs.deploy }}
+    steps:
+      - name: Set Environment
+        id: set-env
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "environment=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
+            echo "deploy=true" >> $GITHUB_OUTPUT
+          elif [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            echo "environment=production" >> $GITHUB_OUTPUT
+            echo "deploy=true" >> $GITHUB_OUTPUT
+          elif [ "${{ github.ref }}" = "refs/heads/develop" ]; then
+            echo "environment=staging" >> $GITHUB_OUTPUT
+            echo "deploy=true" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.ref }}" == refs/heads/release/* ]]; then
+            echo "environment=staging" >> $GITHUB_OUTPUT
+            echo "deploy=true" >> $GITHUB_OUTPUT
+          else
+            echo "environment=development" >> $GITHUB_OUTPUT
+            echo "deploy=false" >> $GITHUB_OUTPUT
+          fi
+
+  # Code Quality and Security Checks
+  quality-gate:
+    name: 🔍 Quality Gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Cache Dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.npm
+            node_modules
+            client/node_modules
+          key: ${{ runner.os }}-npm-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-npm-
+
+      - name: Install Dependencies
+        run: |
+          npm ci --production=false
+          cd client && npm ci --production=false
+
+      - name: Lint Backend
+        run: npm run lint
+
+      - name: Lint Frontend
+        run: cd client && npm run lint
+
+      - name: Type Check Backend
+        run: npx tsc --noEmit
+
+      - name: Type Check Frontend
+        run: cd client && npm run type-check
+
+      - name: Security Audit
+        run: |
+          npm audit --audit-level moderate || true
+          cd client && npm audit --audit-level moderate || true
+
+      - name: Run Tests
+        run: |
+          npm run test -- --coverage --watchAll=false --ci
+          cd client && npm run test -- --coverage --run
+
+      - name: Upload Coverage Reports
+        uses: codecov/codecov-action@v3
+        with:
+          files: ./coverage/lcov.info,./client/coverage/lcov.info
+          flags: backend,frontend
+          name: cteh-coverage
+
+  # Build Application
+  build:
+    name: 🏗️ Build Application
+    runs-on: ubuntu-latest
+    needs: [setup, quality-gate]
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: |
+          npm ci --production=false
+          cd client && npm ci --production=false
+
+      - name: Build Application
+        run: npm run build
+        env:
+          NODE_ENV: production
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: build-artifacts
+          path: |
+            dist/
+            client/dist/
+            package.json
+            package-lock.json
+          retention-days: 30
+
+  # Build and Push Docker Image
+  build-container:
+    name: 🐳 Build Container
+    runs-on: ubuntu-latest
+    needs: [setup, build]
+    if: needs.setup.outputs.deploy == 'true'
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Azure Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.CONTAINER_REGISTRY }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.CONTAINER_REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest-${{ needs.setup.outputs.environment }}
+
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            NODE_ENV=${{ needs.setup.outputs.environment }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run Container Security Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.CONTAINER_REGISTRY }}/${{ env.IMAGE_NAME }}:latest-${{ needs.setup.outputs.environment }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+        continue-on-error: true
+
+      - name: Upload Trivy Scan Results
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+  # Deploy Infrastructure
+  deploy-infrastructure:
+    name: 🏗️ Deploy Infrastructure
+    runs-on: ubuntu-latest
+    needs: [setup, build]
+    if: needs.setup.outputs.deploy == 'true'
+    environment: ${{ needs.setup.outputs.environment }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Deploy ARM Template
+        uses: azure/arm-deploy@v1
+        with:
+          subscriptionId: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          resourceGroupName: rg-cteh-${{ needs.setup.outputs.environment }}
+          template: ./azure-deploy.json
+          parameters: |
+            appName=cteh-platform
+            environment=${{ needs.setup.outputs.environment }}
+            location=${{ secrets.AZURE_LOCATION }}
+            skuName=S1
+
+  # Deploy Application
+  deploy-application:
+    name: 🚀 Deploy Application
+    runs-on: ubuntu-latest
+    needs: [setup, build-container, deploy-infrastructure]
+    if: needs.setup.outputs.deploy == 'true'
+    environment: ${{ needs.setup.outputs.environment }}
+    steps:
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Deploy to Azure Web App
+        uses: azure/webapps-deploy@v2
+        with:
+          app-name: ${{ env.AZURE_WEBAPP_NAME }}-${{ needs.setup.outputs.environment }}
+          slot-name: production
+          images: ${{ env.CONTAINER_REGISTRY }}/${{ env.IMAGE_NAME }}:latest-${{ needs.setup.outputs.environment }}
+
+      - name: Wait for Deployment
+        run: sleep 30
+
+      - name: Health Check
+        run: |
+          APP_URL="https://${{ env.AZURE_WEBAPP_NAME }}-${{ needs.setup.outputs.environment }}.azurewebsites.net"
+          echo "🔍 Testing application at: $APP_URL"
+          
+          # Health check
+          for i in {1..5}; do
+            if curl -f -s "$APP_URL/health" > /dev/null; then
+              echo "✅ Health check passed"
+              break
+            else
+              echo "⏳ Waiting for application to be ready... (attempt $i/5)"
+              sleep 10
+            fi
+          done
+          
+          # API status check
+          if curl -f -s "$APP_URL/api/v1/status" > /dev/null; then
+            echo "✅ API status check passed"
+          else
+            echo "❌ API status check failed"
+            exit 1
+          fi
+
+      - name: Warm Up Application
+        run: |
+          APP_URL="https://${{ env.AZURE_WEBAPP_NAME }}-${{ needs.setup.outputs.environment }}.azurewebsites.net"
+          
+          endpoints=("/" "/api/v1/auth/status" "/api/v1/skills" "/api/v1/users/profile")
+          
+          for endpoint in "${endpoints[@]}"; do
+            echo "🔥 Warming up: $APP_URL$endpoint"
+            curl -s "$APP_URL$endpoint" > /dev/null || echo "⚠️ Could not warm up $endpoint"
+          done
+
+  # Production Validation (only for production deployments)
+  production-validation:
+    name: ✅ Production Validation
+    runs-on: ubuntu-latest
+    needs: [setup, deploy-application]
+    if: needs.setup.outputs.environment == 'production'
+    environment: production
+    steps:
+      - name: Run Production Validation Tests
+        run: |
+          APP_URL="https://${{ env.AZURE_WEBAPP_NAME }}-production.azurewebsites.net"
+          
+          echo "🔍 Running production validation tests..."
+          
+          # Test endpoints
+          declare -A tests=(
+            ["Application Health"]="/health"
+            ["API Status"]="/api/v1/status"
+            ["Authentication Endpoint"]="/api/v1/auth/status"
+            ["Skills API"]="/api/v1/skills"
+            ["Static Assets"]="/favicon.ico"
+          )
+          
+          failed_tests=0
+          
+          for test_name in "${!tests[@]}"; do
+            endpoint="${tests[$test_name]}"
+            url="$APP_URL$endpoint"
+            
+            if curl -f -s -w "%{http_code}" "$url" | grep -q "200"; then
+              echo "✅ $test_name - PASS"
+            else
+              echo "❌ $test_name - FAIL"
+              ((failed_tests++))
+            fi
+          done
+          
+          if [ $failed_tests -gt 0 ]; then
+            echo "❌ $failed_tests validation test(s) failed!"
+            exit 1
+          else
+            echo "🎉 All validation tests passed!"
+          fi
+
+      - name: Performance Baseline Test
+        run: |
+          APP_URL="https://${{ env.AZURE_WEBAPP_NAME }}-production.azurewebsites.net"
+          
+          echo "⚡ Running performance baseline test..."
+          
+          start_time=$(date +%s%3N)
+          if curl -f -s "$APP_URL" > /dev/null; then
+            end_time=$(date +%s%3N)
+            response_time=$((end_time - start_time))
+            
+            echo "📈 Homepage load time: ${response_time}ms"
+            
+            if [ $response_time -lt 5000 ]; then
+              echo "✅ Performance baseline met (< 5 seconds)"
+            else
+              echo "⚠️ Performance baseline exceeded (> 5 seconds)"
+            fi
+          else
+            echo "❌ Performance test failed"
+            exit 1
+          fi
+
+  # Notifications
+  notify:
+    name: 📢 Notifications
+    runs-on: ubuntu-latest
+    needs: [setup, deploy-application, production-validation]
+    if: always() && needs.setup.outputs.deploy == 'true'
+    steps:
+      - name: Determine Status
+        id: status
+        run: |
+          if [ "${{ needs.deploy-application.result }}" = "success" ] && [ "${{ needs.production-validation.result }}" != "failure" ]; then
+            echo "status=✅ SUCCESS" >> $GITHUB_OUTPUT
+            echo "color=28a745" >> $GITHUB_OUTPUT
+          else
+            echo "status=❌ FAILED" >> $GITHUB_OUTPUT
+            echo "color=d73a49" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Send Slack Notification
+        if: env.SLACK_WEBHOOK_URL != ''
+        uses: 8398a7/action-slack@v3
+        with:
+          status: custom
+          custom_payload: |
+            {
+              "text": "CTEH Platform Deployment",
+              "attachments": [
+                {
+                  "color": "${{ steps.status.outputs.color }}",
+                  "fields": [
+                    {
+                      "title": "Environment",
+                      "value": "${{ needs.setup.outputs.environment }}",
+                      "short": true
+                    },
+                    {
+                      "title": "Status",
+                      "value": "${{ steps.status.outputs.status }}",
+                      "short": true
+                    },
+                    {
+                      "title": "Branch",
+                      "value": "${{ github.ref_name }}",
+                      "short": true
+                    },
+                    {
+                      "title": "Commit",
+                      "value": "${{ github.sha }}",
+                      "short": true
+                    },
+                    {
+                      "title": "Application URL",
+                      "value": "https://${{ env.AZURE_WEBAPP_NAME }}-${{ needs.setup.outputs.environment }}.azurewebsites.net",
+                      "short": false
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      - name: Send Teams Notification
+        if: env.TEAMS_WEBHOOK_URL != ''
+        run: |
+          curl -H "Content-Type: application/json" -d '{
+            "@type": "MessageCard",
+            "@context": "http://schema.org/extensions",
+            "themeColor": "${{ steps.status.outputs.color }}",
+            "summary": "CTEH Platform Deployment",
+            "sections": [{
+              "activityTitle": "CTEH Platform Deployment",
+              "activitySubtitle": "${{ steps.status.outputs.status }}",
+              "facts": [{
+                "name": "Environment",
+                "value": "${{ needs.setup.outputs.environment }}"
+              }, {
+                "name": "Branch",
+                "value": "${{ github.ref_name }}"
+              }, {
+                "name": "Commit",
+                "value": "${{ github.sha }}"
+              }, {
+                "name": "Application URL",
+                "value": "https://${{ env.AZURE_WEBAPP_NAME }}-${{ needs.setup.outputs.environment }}.azurewebsites.net"
+              }]
+            }]
+          }' ${{ secrets.TEAMS_WEBHOOK_URL }}
+        env:
+          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+
+      - name: Create GitHub Release
+        if: needs.setup.outputs.environment == 'production' && needs.deploy-application.result == 'success'
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: v${{ github.run_number }}
+          release_name: CTEH Platform v${{ github.run_number }}
+          body: |
+            ## 🚀 CTEH Platform Release v${{ github.run_number }}
+            
+            **Environment:** Production
+            **Deployed:** ${{ github.event.head_commit.timestamp }}
+            **Commit:** ${{ github.sha }}
+            **Branch:** ${{ github.ref_name }}
+            
+            ### 🔗 Links
+            - **Application:** https://${{ env.AZURE_WEBAPP_NAME }}-production.azurewebsites.net
+            - **Health Check:** https://${{ env.AZURE_WEBAPP_NAME }}-production.azurewebsites.net/health
+            - **API Status:** https://${{ env.AZURE_WEBAPP_NAME }}-production.azurewebsites.net/api/v1/status
+            
+            ### 📋 Changes
+            ${{ github.event.head_commit.message }}
+            
+            ---
+            *Deployed via GitHub Actions*
+          draft: false
+          prerelease: false
